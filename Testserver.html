@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calli - 김실장 현장 비서</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        .visualizer-bar { transition: height 0.05s ease; will-change: height; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    </style>
+</head>
+<body class="bg-slate-100 h-screen flex flex-col items-center justify-center font-sans text-slate-800">
+
+    <div class="w-full max-w-md bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200 flex flex-col h-[85vh]">
+        
+        <div class="bg-indigo-600 p-6 pt-10 text-center relative shrink-0">
+            <div class="absolute top-4 left-4 bg-indigo-500/50 px-2 py-1 rounded text-[10px] text-white font-mono" id="connectionStatus">Ready</div>
+            <h1 class="text-2xl font-bold text-white flex items-center justify-center gap-2">
+                <i data-lucide="hard-hat"></i> 김실장 (Calli)
+            </h1>
+            <p class="text-indigo-100 text-sm opacity-90 mt-1">현장 사장님을 위한 AI 음성 비서</p>
+        </div>
+
+        <div class="h-24 bg-indigo-600/5 flex items-center justify-center gap-1 shrink-0" id="visualizer">
+            </div>
+
+        <div class="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50" id="chatContainer">
+            <div class="text-center text-xs text-slate-400 my-4">- 통화가 시작되면 대화 내용이 표시됩니다 -</div>
+        </div>
+
+        <div class="h-24 bg-black text-green-400 text-[10px] font-mono p-2 overflow-y-auto border-t border-slate-300 shrink-0" id="debugLog">
+            <div>> System initialized...</div>
+        </div>
+
+        <div class="p-6 bg-white shrink-0">
+            <button id="callBtn" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-4 rounded-xl shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2">
+                <i data-lucide="phone"></i> 통화 시작
+            </button>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        // DOM Elements
+        const callBtn = document.getElementById('callBtn');
+        const chatContainer = document.getElementById('chatContainer');
+        const debugLog = document.getElementById('debugLog');
+        const statusLabel = document.getElementById('connectionStatus');
+        const visualizer = document.getElementById('visualizer');
+
+        // Variables
+        let ws = null;
+        let audioCtx = null;
+        let processor = null;
+        let inputSource = null;
+        let nextStartTime = 0; // 끊김 없는 재생을 위한 스케줄러
+        let activeSources = []; // 현재 재생 중인 소스들 (Barge-in 시 중단용)
+
+        // Visualizer Setup
+        for(let i=0; i<30; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'visualizer-bar w-1.5 bg-indigo-300 rounded-full h-1';
+            visualizer.appendChild(bar);
+        }
+        const bars = document.querySelectorAll('.visualizer-bar');
+
+        // --- 유틸리티 함수 ---
+        function log(msg, type='info') {
+            const div = document.createElement('div');
+            div.innerText = `> ${msg}`;
+            if(type === 'error') div.className = 'text-red-400';
+            debugLog.prepend(div);
+        }
+
+        function addChatBubble(text, role) {
+            const div = document.createElement('div');
+            const isAI = role === 'ai';
+            div.className = `flex ${isAI ? 'justify-start' : 'justify-end'}`;
+            div.innerHTML = `
+                <div class="max-w-[80%] px-4 py-2 rounded-2xl text-sm ${
+                    isAI 
+                    ? 'bg-white border border-slate-200 text-slate-700 rounded-tl-none shadow-sm' 
+                    : 'bg-indigo-600 text-white rounded-tr-none shadow-md'
+                }">
+                    ${text}
+                </div>
+            `;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // --- 오디오 처리 (핵심) ---
+        async function initAudio() {
+            // 24kHz 설정 (OpenAI Realtime 기본 권장)
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+            
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: { 
+                    channelCount: 1, 
+                    sampleRate: 24000,
+                    echoCancellation: true,
+                    noiseSuppression: true
+                } 
+            });
+
+            inputSource = audioCtx.createMediaStreamSource(stream);
+            // ScriptProcessor: 4096 버퍼 사이즈 (약 0.17초 단위 전송)
+            processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+            inputSource.connect(processor);
+            processor.connect(audioCtx.destination);
+
+            processor.onaudioprocess = (e) => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+                const inputData = e.inputBuffer.getChannelData(0);
+                
+                // PCM16 변환 (Float32 -> Int16)
+                const pcm16 = new Int16Array(inputData.length);
+                for (let i = 0; i < inputData.length; i++) {
+                    // 클리핑 방지 (-1.0 ~ 1.0)
+                    let s = Math.max(-1, Math.min(1, inputData[i]));
+                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                // Base64 인코딩하여 전송
+                const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
+                ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+
+                // 로컬 시각화 업데이트
+                updateVisualizer(inputData);
+            };
+        }
+
+        function updateVisualizer(data) {
+            let sum = 0;
+            for(let i=0; i<data.length; i+=10) sum += Math.abs(data[i]);
+            const avg = sum / (data.length / 10);
+            
+            const amp = Math.min(avg * 500, 100); // 증폭
+
+            bars.forEach((bar, idx) => {
+                // 파동 효과
+                const h = Math.max(4, Math.random() * amp * (idx % 2 === 0 ? 1 : 0.5));
+                bar.style.height = `${h}px`;
+                bar.style.backgroundColor = amp > 10 ? '#4f46e5' : '#cbd5e1';
+            });
+        }
+
+        // --- 오디오 재생 (AI 음성) ---
+        async function playAudioChunk(base64Data) {
+            try {
+                // Base64 -> ArrayBuffer -> Int16 -> Float32 변환
+                const binaryString = atob(base64Data);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+                
+                const int16 = new Int16Array(bytes.buffer);
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+                const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+                buffer.getChannelData(0).set(float32);
+
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioCtx.destination);
+
+                // 스케줄링 로직 (끊김 방지)
+                const now = audioCtx.currentTime;
+                // 다음 재생 시간이 현재보다 과거면(지연 발생 시) 현재 시간으로 맞춤
+                if (nextStartTime < now) nextStartTime = now;
+                
+                source.start(nextStartTime);
+                nextStartTime += buffer.duration; // 다음 청크 재생 시작 시간 갱신
+
+                activeSources.push(source);
+                
+                // 재생 끝나면 배열에서 제거 (메모리 관리)
+                source.onended = () => {
+                    activeSources = activeSources.filter(s => s !== source);
+                };
+
+            } catch (err) {
+                log(`Audio play error: ${err}`, 'error');
+            }
+        }
+
+        function stopAllAudio() {
+            log("🛑 Barge-in: Stopping audio", 'error');
+            activeSources.forEach(src => {
+                try { src.stop(); } catch(e){}
+            });
+            activeSources = [];
+            nextStartTime = 0; // 시간 초기화
+        }
+
+        // --- WebSocket 제어 ---
+        callBtn.onclick = async () => {
+            if (ws) { // 연결 종료
+                ws.close();
+                return;
+            }
+
+            try {
+                await initAudio();
+                ws = new WebSocket('ws://localhost:8000/media-stream');
+                // 로컬 테스트용 하드코딩 필요시: new WebSocket('ws://localhost:8000/media-stream');
+
+                ws.onopen = () => {
+                    statusLabel.innerText = "Connected";
+                    statusLabel.className = "absolute top-4 left-4 bg-green-500 px-2 py-1 rounded text-[10px] text-white font-mono";
+                    callBtn.innerHTML = `<i data-lucide="phone-off"></i> 통화 종료`;
+                    callBtn.className = "w-full bg-red-500 hover:bg-red-600 text-white font-bold py-4 rounded-xl shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2";
+                    log("WebSocket connected");
+                };
+
+                ws.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'audio') {
+                        playAudioChunk(data.audio);
+                    } else if (data.type === 'log') {
+                        addChatBubble(data.text, data.role);
+                    } else if (data.type === 'stop_audio') {
+                        stopAllAudio();
+                        addChatBubble("⚡ (말 끊음)", "user");
+                    }
+                };
+
+                ws.onclose = () => {
+                    statusLabel.innerText = "Disconnected";
+                    statusLabel.className = "absolute top-4 left-4 bg-slate-500 px-2 py-1 rounded text-[10px] text-white font-mono";
+                    callBtn.innerHTML = `<i data-lucide="phone"></i> 통화 시작`;
+                    callBtn.className = "w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-4 rounded-xl shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2";
+                    
+                    if(processor) processor.disconnect();
+                    if(inputSource) inputSource.disconnect();
+                    if(audioCtx) audioCtx.close();
+                    
+                    ws = null;
+                    log("WebSocket disconnected");
+                };
+
+            } catch (err) {
+                console.error(err);
+                alert("마이크 접근 권한이 필요합니다.");
+            }
+        };
+    </script>
+</body>
+</html>
