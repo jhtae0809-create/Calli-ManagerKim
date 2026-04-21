@@ -17,7 +17,7 @@ app = FastAPI()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# 🚀 플랜 B: Twilio SMS 차단을 우회할 Make 웹훅 주소 (반드시 본인 주소로 변경!)
+# 플랜 B: Twilio SMS 차단을 우회할 Make 웹훅 주소 (반드시 본인 주소로 변경!)
 MAKE_WEBHOOK_URL = "https://hook.us1.make.com/xxxxxxxxxxxxxx" 
 BOSS_PHONE_NUMBER = "+1814xxxxxxx" # 사장님 본인 번호 (요약 받을 번호)
 
@@ -28,7 +28,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # 모델명 주의: Realtime API는 모델 버전에 민감합니다.
 OPENAI_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
 
-# 👷 김실장 페르소나 (유지)
+# 김실장 페르소나 (유지)
 SYSTEM_INSTRUCTION = """
 [Persona]
 [CRITICAL INSTRUCTION]
